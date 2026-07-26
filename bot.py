@@ -1,8 +1,19 @@
 import os
 import base64
 import logging
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+import asyncio
+from datetime import date
+from collections import defaultdict
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 import anthropic
 
 logging.basicConfig(level=logging.INFO)
@@ -13,7 +24,42 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-SYSTEM_PROMPT = """Ты — эксперт по химчистке мебели с 10-летним опытом. Тебе присылают фото ткани мебели (диван, кресло, стул и т.д.), твоя задача — определить тип ткани и дать протокол чистки.
+DAILY_LIMIT = 30
+MEDIA_GROUP_WAIT_SECONDS = 1.5
+
+# В памяти: {user_id: (date, count)} — сбрасывается при каждом новом дне
+user_usage = defaultdict(lambda: (date.today(), 0))
+
+# Буфер для альбомов фото (несколько фото одним сообщением)
+media_group_buffer = {}
+
+WELCOME_TEXT = """👋 Привет, {name}!
+
+Это чат-бот для определения типа обивочной ткани мебели по фото и подбора протокола чистки.
+
+🤖 Как пользоваться:
+1. Пришлите макрофото ткани прямо в этот чат
+2. Бот ответит автоматически: тип ткани, состав, рекомендации по чистке и работе
+3. Под ответом нажмите 👍 если верно или 👎 если ошибся — бот учится на отзывах
+
+📸 Фото должно быть качественным:
+• Макро, расстояние 5–10 см от ткани
+• Перпендикулярно поверхности
+• Дневной свет, без вспышки и бликов
+• В кадре только ткань — без молний, швов, фурнитуры
+• Если есть care tag (этикетка с составом) — отдельным фото, бот её прочитает и приоритизирует
+
+📦 Можно прислать несколько ракурсов одной мебели одним сообщением — бот сделает комбинированный анализ.
+
+⚠ Если бот не уверен (точность ниже 80%) — он предложит обсудить тип ткани с коллегами в чате.
+
+🚫 Лимит: {limit} запросов в сутки на пользователя.
+
+Удачи! 🧵"""
+
+SYSTEM_PROMPT = """Ты — эксперт по химчистке мебели с 10-летним опытом. Тебе присылают одно или несколько фото ткани мебели (диван, кресло, стул и т.д.), твоя задача — определить тип ткани и дать протокол чистки.
+
+Если фото несколько — рассматривай их как разные ракурсы одной и той же ткани и делай один общий (комбинированный) вывод. Если среди фото есть care tag (этикетка с составом) — приоритизируй информацию с неё над визуальным анализом и явно укажи, что состав подтверждён биркой.
 
 ФОРМАТ ОТВЕТА (строго придерживайся структуры):
 
@@ -75,47 +121,115 @@ Pre-spray (основная чистка):
 
 ПРАВИЛА АНАЛИЗА:
 1. Смотри на плетение нитей, текстуру, блеск, ворсистость, наличие узлов
-2. Если уверенность ниже 80% — добавь: "⚠ Уверенность ниже 80% — рекомендуем прислать макрофото бирки состава (care tag) или уточнить у мастера"
+2. Если уверенность ниже 80% — добавь в конец: "⚠ Уверенность ниже 80% — рекомендуем обсудить тип ткани с коллегами в чате или прислать макрофото бирки состава (care tag)"
 3. Никогда не выдумывай средства, которых нет в списке выше
 4. Если на фото флакон химии — просто опиши, что это за средство и для чего оно
 5. Если на фото не мебель/не химия — вежливо попроси прислать фото ткани крупным планом
+6. Держи ответ по существу, укладывайся в разумный объём — не растягивай без необходимости
 """
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await context.bot.send_message(chat_id=chat_id, text="🔍 Анализирую ткань, секунду...")
+def check_and_increment_limit(user_id: int) -> tuple[bool, int]:
+    """Возвращает (разрешено ли, сколько запросов осталось после этого)."""
+    today = date.today()
+    last_date, count = user_usage[user_id]
+    if last_date != today:
+        count = 0
+    if count >= DAILY_LIMIT:
+        return False, 0
+    count += 1
+    user_usage[user_id] = (today, count)
+    return True, DAILY_LIMIT - count
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name or "друг"
+    await update.message.reply_text(WELCOME_TEXT.format(name=name, limit=DAILY_LIMIT))
+
+
+def feedback_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👍 Верно", callback_data="feedback_good"),
+                InlineKeyboardButton("👎 Ошибся", callback_data="feedback_bad"),
+            ]
+        ]
+    )
+
+
+async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "feedback_good":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Спасибо за подтверждение! 👍")
+    else:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "Спасибо, учтём! Если можете — пришлите макрофото бирки состава (care tag), это поможет точнее определить ткань в следующий раз. 👎"
+        )
+    logger.info(f"Фидбек от {query.from_user.id}: {query.data}")
+
+
+async def analyze_images(image_bytes_list):
+    content = []
+    for photo_bytes in image_bytes_list:
+        base64_image = base64.b64encode(photo_bytes).decode("utf-8")
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64_image,
+                },
+            }
+        )
+    content.append(
+        {
+            "type": "text",
+            "text": "Проанализируй эту ткань (или эти фото одной ткани/бирки) и дай протокол чистки.",
+        }
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1800,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+async def process_photos(chat_id: int, user_id: int, photos, context: ContextTypes.DEFAULT_TYPE):
+    allowed, remaining = check_and_increment_limit(user_id)
+    if not allowed:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🚫 Вы достигли лимита {DAILY_LIMIT} запросов в сутки. Попробуйте завтра.",
+        )
+        return
+
+    status_msg = await context.bot.send_message(chat_id=chat_id, text="🔍 Анализирую ткань, секунду...")
 
     try:
-        photo = update.message.photo[-1]
-        photo_file = await photo.get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        base64_image = base64.b64encode(photo_bytes).decode("utf-8")
+        image_bytes_list = []
+        for photo in photos:
+            largest = photo[-1]
+            photo_file = await largest.get_file()
+            photo_bytes = await photo_file.download_as_bytearray()
+            image_bytes_list.append(bytes(photo_bytes))
 
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": base64_image,
-                            },
-                        },
-                        {"type": "text", "text": "Проанализируй эту ткань и дай протокол чистки."},
-                    ],
-                }
-            ],
+        answer = await analyze_images(image_bytes_list)
+
+        await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{answer}\n\n_Осталось запросов сегодня: {remaining}_",
+            reply_markup=feedback_keyboard(),
+            parse_mode="Markdown",
         )
-
-        answer = "".join(block.text for block in response.content if block.type == "text")
-        await context.bot.send_message(chat_id=chat_id, text=answer)
 
     except Exception as e:
         logger.error(f"Ошибка при анализе фото: {e}")
@@ -123,6 +237,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             text="Что-то пошло не так при анализе фото. Попробуйте отправить ещё раз.",
         )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    media_group_id = update.message.media_group_id
+
+    if not media_group_id:
+        await process_photos(chat_id, user_id, [update.message.photo], context)
+        return
+
+    key = (chat_id, media_group_id)
+    if key not in media_group_buffer:
+        media_group_buffer[key] = []
+    media_group_buffer[key].append(update.message.photo)
+
+    await asyncio.sleep(MEDIA_GROUP_WAIT_SECONDS)
+
+    if media_group_buffer.get(key) and len(media_group_buffer[key]) > 0:
+        photos = media_group_buffer.pop(key, None)
+        if photos:
+            await process_photos(chat_id, user_id, photos, context)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,7 +274,9 @@ def main():
         )
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(handle_feedback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Бот запущен и слушает сообщения...")
